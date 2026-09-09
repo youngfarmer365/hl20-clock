@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HL-20 serial -> local countdown clock. Listen only. 38400 8N1.
 
-  python hl20_bridge.py --port COM5 --pens "Pen 1:500,Pen 2:450,Pen 3:300"
+  python hl20_bridge.py --port COM5 --pens \"Pen 1:500,Pen 2:450,Pen 3:300\"
   Open http://127.0.0.1:8765/
 """
 from __future__ import annotations
@@ -256,7 +256,7 @@ async function tick(){
       return '<li class="' + (i===j.penIndex ? 'here' : '') + '">' + p.name + '  ' + Math.round(p.kg) + ' kg'
         + (p.actualKg!=null ? (' -> ' + p.actualKg) : '') + '</li>';
     }).join('');
-    document.getElementById('log').textContent = (j.log||[]).slice(-8).join('\n');
+    document.getElementById('log').textContent = (j.log||[]).slice(-8).join(' / ');
   }catch(e){
     document.getElementById('meta').textContent = 'no /weight (' + e + ')';
     document.getElementById('meta').className = 'meta err';
