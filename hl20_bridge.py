@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""HL-20 serial -> local countdown clock. Listen only. 38400 8N1.
+"""HL-20 serial <-> local countdown clock. 38400 8N1.
 
-  python hl20_bridge.py --port COM5 --pens \"Pen 1:500,Pen 2:450,Pen 3:300\"
+Listens on USB RX (white). Sends 0 / Total on USB TX (yellow).
+
+  python hl20_bridge.py --port COM5 --pens "Pen 1:500,Pen 2:450,Pen 3:300"
   Open http://127.0.0.1:8765/
 """
 from __future__ import annotations
@@ -30,6 +32,12 @@ LINE_RE = re.compile(
 )
 
 lock = threading.RLock()
+ser_lock = threading.Lock()
+ser_port = None
+KEYS = {
+    "zero": "00001000",
+    "total": "00400000",
+}
 state = {
     "totalKg": None,
     "partialKg": None,
@@ -55,6 +63,30 @@ state = {
     "log": [],
 }
 pens = []
+
+
+def key_frame(payload8):
+    cs = 82 + sum(int(c) for c in payload8)
+    return b"\x02" + ("%s%02d" % (payload8, cs)).encode("ascii") + b"\x05"
+
+
+def send_key(name):
+    payload = KEYS.get(name)
+    if not payload:
+        return "unknown key"
+    pkt = key_frame(payload)
+    with ser_lock:
+        if ser_port is None:
+            log("send %s failed: serial not open" % name)
+            return "serial not open"
+        try:
+            ser_port.write(pkt)
+            ser_port.flush()
+        except Exception as exc:
+            log("send %s failed: %s" % (name, exc))
+            return str(exc)
+    log("sent %s" % name)
+    return None
 
 
 def log(msg):
@@ -227,6 +259,10 @@ button{font-size:1.15rem;padding:14px 18px;border:0;border-radius:14px;backgroun
 <button class="ghost" id="bDone">Record and next</button>
 <button class="ghost" id="bPrev">Back</button>
 </div>
+<div class="row" style="margin-top:10px">
+<button class="ghost" id="bZero">Zero on mixer</button>
+<button class="ghost" id="bTotal">Total on mixer</button>
+</div>
 <ul id="pens"></ul>
 <pre class="meta" id="log"></pre>
 <script>
@@ -266,6 +302,8 @@ function post(path){ fetch(path,{method:'POST'}).then(tick); }
 document.getElementById('bStart').onclick = function(){ post('/start'); };
 document.getElementById('bDone').onclick = function(){ post('/done'); };
 document.getElementById('bPrev').onclick = function(){ post('/prev'); };
+document.getElementById('bZero').onclick = function(){ post('/zero'); };
+document.getElementById('bTotal').onclick = function(){ post('/total'); };
 setInterval(tick, 300);
 tick();
 </script>
@@ -337,6 +375,10 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 state["targetKg"] = kg
             start_pen()
+        elif path == "/zero":
+            send_key("zero")
+        elif path == "/total":
+            send_key("total")
         else:
             self._send(404, "application/json", json.dumps({"error": "not found"}))
             return
@@ -344,6 +386,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def reader(port, baud):
+    global ser_port
     try:
         ser = serial.Serial(port, baud, timeout=0.2)
     except Exception as exc:
@@ -351,11 +394,14 @@ def reader(port, baud):
         with lock:
             state["error"] = str(exc)
         return
+    with ser_lock:
+        ser_port = ser
     buf = ""
     log("listening %s %s" % (port, baud))
     while True:
         try:
-            chunk = ser.read(256)
+            with ser_lock:
+                chunk = ser.read(256)
         except Exception as exc:
             log("serial error: %s" % exc)
             time.sleep(0.5)
