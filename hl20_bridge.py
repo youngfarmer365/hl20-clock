@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HL-20 serial <-> local countdown clock. 38400 8N1.
 
-Listens on USB RX (white). Sends 0 / Total on USB TX (yellow).
+Listens on USB RX (white). Sends 0 / Total / Enter on USB TX (yellow).
 
   python hl20_bridge.py --port COM5 --pens "Pen 1:500,Pen 2:450,Pen 3:300"
   Open http://127.0.0.1:8765/
@@ -38,6 +38,9 @@ KEYS = {
     "zero": "00001000",
     "total": "00400000",
 }
+RAW_KEYS = {
+    "enter": bytes.fromhex("023030303030303830383a05"),
+}
 state = {
     "totalKg": None,
     "partialKg": None,
@@ -70,11 +73,13 @@ def key_frame(payload8):
     return b"\x02" + ("%s%02d" % (payload8, cs)).encode("ascii") + b"\x05"
 
 
-def send_key(name):
+def send_key(name, quiet=False):
     payload = KEYS.get(name)
-    if not payload:
-        return "unknown key"
-    pkt = key_frame(payload)
+    pkt = RAW_KEYS.get(name)
+    if pkt is None:
+        if not payload:
+            return "unknown key"
+        pkt = key_frame(payload)
     with ser_lock:
         if ser_port is None:
             log("send %s failed: serial not open" % name)
@@ -85,8 +90,26 @@ def send_key(name):
         except Exception as exc:
             log("send %s failed: %s" % (name, exc))
             return str(exc)
-    log("sent %s" % name)
+    if not quiet:
+        log("sent %s" % name)
     return None
+
+
+def zero_total():
+    def run():
+        log("ZERO TOTAL  hold Total 3s then Enter")
+        for _ in range(25):
+            err = send_key("total", quiet=True)
+            if err:
+                return
+            time.sleep(0.12)
+        time.sleep(0.2)
+        for _ in range(3):
+            send_key("enter", quiet=True)
+            time.sleep(0.15)
+        log("ZERO TOTAL  done")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def log(msg):
@@ -260,8 +283,9 @@ button{font-size:1.15rem;padding:14px 18px;border:0;border-radius:14px;backgroun
 <button class="ghost" id="bPrev">Back</button>
 </div>
 <div class="row" style="margin-top:10px">
-<button class="ghost" id="bZero">Zero on mixer</button>
+<button class="ghost" id="bZero">Zero partial</button>
 <button class="ghost" id="bTotal">Total on mixer</button>
+<button class="ghost" id="bZeroTotal">Zero total</button>
 </div>
 <ul id="pens"></ul>
 <pre class="meta" id="log"></pre>
@@ -304,6 +328,7 @@ document.getElementById('bDone').onclick = function(){ post('/done'); };
 document.getElementById('bPrev').onclick = function(){ post('/prev'); };
 document.getElementById('bZero').onclick = function(){ post('/zero'); };
 document.getElementById('bTotal').onclick = function(){ post('/total'); };
+document.getElementById('bZeroTotal').onclick = function(){ post('/zero-total'); };
 setInterval(tick, 300);
 tick();
 </script>
@@ -379,6 +404,10 @@ class Handler(BaseHTTPRequestHandler):
             send_key("zero")
         elif path == "/total":
             send_key("total")
+        elif path == "/enter":
+            send_key("enter")
+        elif path in ("/zero-total", "/zerototal"):
+            zero_total()
         else:
             self._send(404, "application/json", json.dumps({"error": "not found"}))
             return
