@@ -94,6 +94,7 @@ def sb_json(token: str, method: str, path: str, query: dict | None = None, body=
     req.add_header("apikey", SB_ANON)
     req.add_header("Authorization", "Bearer " + token)
     req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "MixerClock/8")
     if raw_body is not None:
         req.add_header("Content-Type", "application/json")
     try:
@@ -605,8 +606,8 @@ body.flash-over{background:#4a0000}
 <section class="screen" id="sHome">
   <div class="top">
     <div>
-      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v7</span></div>
-      <div class="sub" id="syncTag"><span class="dot" id="netDot"></span>Never synced</div>
+      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v8</span></div>
+      <div class="sub"><span class="dot" id="netDot"></span><span id="syncTag">Never synced</span></div>
     </div>
     <div class="row" style="flex:0 0 auto">
       <button class="ghost" id="bRefresh" style="flex:0 0 auto">Refresh</button>
@@ -698,7 +699,7 @@ var SB_URL='https://bjzvjmaiyuvjmyhozbpq.supabase.co';
 var SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJqenZqbWFpeXV2am15aG96YnBxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUyNDE3MjgsImV4cCI6MjEwMDgxNzcyOH0.AkB9U_QWODouWtTAJr10yaz6Qj9-Deki4NMLxhtHb3o';
 var sb=supabase.createClient(SB_URL,SB_KEY);
 var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false,refreshGen=0,lastErr='';
-var CACHE='mc_cache_v7', QUEUE='mc_queue';
+var CACHE='mc_cache_v8', QUEUE='mc_queue';
 function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function doneKey(){return 'mc_done_'+today();}
 function show(id){['sLogin','sHome','sBuffer','sAmount','sFill','sClock','sBay'].forEach(function(s){document.getElementById(s).className='screen'+(s===id?' on':'');}); if(id==='sFill'||id==='sClock') armWake();}
@@ -728,7 +729,11 @@ function holdBtn(id, path){
  ['pointerup','pointercancel','pointerleave'].forEach(function(ev){ btn.addEventListener(ev, up); });
 }
 function post(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});}
-function loadCache(){try{return JSON.parse(localStorage.getItem(CACHE)||'null');}catch(e){return null;}}
+function loadCache(){
+ try{
+  return JSON.parse(localStorage.getItem('mc_cache_v8')||localStorage.getItem('mc_cache_v7')||localStorage.getItem('mc_cache')||'null');
+ }catch(e){ return null; }
+}
 function saveCache(){localStorage.setItem(CACHE,JSON.stringify({farmId:farmId,lastSync:lastSync,loads:loads,premixes:premixes}));}
 function queue(){try{return JSON.parse(localStorage.getItem(QUEUE)||'[]');}catch(e){return [];}}
 function setQueue(q){localStorage.setItem(QUEUE,JSON.stringify(q));}
@@ -767,14 +772,27 @@ function resolveBlend(day,phases){
  var last=s[s.length-1]; return {from:last.diet_id,to:last.diet_id,fs:1,ts:0};
 }
 async function authToken(){
- var s=await withTimeout(sb.auth.getSession(),4000);
- return s&&s.data&&s.data.session&&s.data.session.access_token;
+ try{
+  var keys=Object.keys(localStorage);
+  for(var i=0;i<keys.length;i++){
+   if(keys[i].indexOf('auth-token')<0) continue;
+   var o=JSON.parse(localStorage.getItem(keys[i])||'null');
+   var t=(o&&o.access_token)||(o&&o.currentSession&&o.currentSession.access_token);
+   if(t) return t;
+  }
+ }catch(e){}
+ try{
+  var s=await withTimeout(sb.auth.getSession(),4000);
+  return s&&s.data&&s.data.session&&s.data.session.access_token;
+ }catch(e){ return null; }
 }
 async function pullViaLaptop(){
  var token=await authToken();
- if(!token) throw new Error('Not signed in');
+ if(!token) throw new Error('Not signed in — tap Log out then log in again');
  var r=await withTimeout(fetch('/fm-pull',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})}),20000);
- var d=await r.json();
+ var txt=await r.text();
+ var d={};
+ try{ d=JSON.parse(txt); }catch(e){ throw new Error('laptop reply: '+txt.slice(0,120)); }
  if(!r.ok||d.error) throw new Error((d&&d.error)||('HTTP '+r.status));
  farmId=d.farmId||farmId;
  loads=d.loads||[];
@@ -949,22 +967,20 @@ async function flushQueue(){
 
 async function afterLogin(force){
  if(loggedOut && !force){ show('sLogin'); return; }
- var user=null;
- try{
-  var gu=await withTimeout(sb.auth.getUser(), 6000);
-  user=gu && gu.data && gu.data.user;
- }catch(e){ user=null; }
  var cache=loadCache();
- if(!user && cache && !force && !loggedOut){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; online=false; renderHome(); show('sHome'); return; }
- if(!user){ show('sLogin'); return; }
+ var token=await authToken();
+ if(!token){
+  if(cache && !force && !loggedOut){
+   farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; online=false; lastErr='Not signed in';
+   renderHome(); show('sHome'); return;
+  }
+  show('sLogin'); return;
+ }
  loggedOut=false;
  if(cache&&cache.farmId){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; renderHome(); show('sHome'); }
  try{
-  var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),8000);
-  farmId=mem.data&&mem.data.farm_id;
-  if(!farmId){ document.getElementById('loginErr').textContent='No farm on this login'; show('sLogin'); return; }
   await pullViaLaptop();
-  online=true; lastErr=''; try{ await withTimeout(flushQueue(),8000); }catch(e){}
+  try{ await withTimeout(flushQueue(),8000); }catch(e){}
  }catch(e){
   online=false;
   lastErr=(e&&e.message)?e.message:'could not reach Farm Manager';
@@ -974,15 +990,20 @@ async function afterLogin(force){
 }
 
 function renderHome(){
+ var tabL=document.getElementById('tabLoads');
+ var tabP=document.getElementById('tabPremix');
+ var dot=document.getElementById('netDot');
+ var tag=document.getElementById('syncTag');
+ var q=document.getElementById('queueTag');
+ var box=document.getElementById('listBox');
+ if(tabL) tabL.className=tab==='loads'?'on':'ghost';
+ if(tabP) tabP.className=tab==='premix'?'on':'ghost';
+ if(dot) dot.className='dot'+(online?' on':'');
+ if(tag) tag.textContent=fmtWhen(lastSync)+(online?'':' · offline')+(lastErr?(' · '+lastErr):'');
+ var qn=queue().length;
+ if(q) q.textContent=loads.length+' loads · '+premixes.length+' premixes'+(qn?(' · '+qn+' queued'):'');
+ if(!box) return;
  try{
-  document.getElementById('tabLoads').className=tab==='loads'?'on':'ghost';
-  document.getElementById('tabPremix').className=tab==='premix'?'on':'ghost';
-  document.getElementById('netDot').className='dot'+(online?' on':'');
-  var status=fmtWhen(lastSync)+(online?'':' · offline')+(lastErr?(' · '+lastErr):'');
-  document.getElementById('syncTag').innerHTML='<span class="dot '+(online?'on':'')+'"></span>'+status;
-  var qn=queue().length;
-  document.getElementById('queueTag').textContent=loads.length+' loads · '+premixes.length+' premixes'+(qn?(' · '+qn+' queued'):'');
-  var box=document.getElementById('listBox');
   if(tab==='loads'){
    box.innerHTML=loads.length?loads.map(function(m,i){
     var done=isDone(m.id);
@@ -997,8 +1018,7 @@ function renderHome(){
    }).join(''):'<p class="sub">No premixes in Farm Manager. Open Feeding → Premixes, tap Save premix, then Refresh here.</p>';
   }
  }catch(e){
-  lastErr=e.message||String(e);
-  document.getElementById('listBox').innerHTML='<p class="sub">List error: '+lastErr+'</p>';
+  box.innerHTML='<p class="sub">List error: '+(e.message||e)+'</p>';
  }
 }
 function setOrder(i,v){
@@ -1307,8 +1327,9 @@ async function tick(){
 }
 setInterval(tick,250); tick();
 if('serviceWorker' in navigator){
- navigator.serviceWorker.getRegistrations().then(function(rs){ rs.forEach(function(r){ r.update(); }); });
- navigator.serviceWorker.register('/sw.js').catch(function(){});
+ navigator.serviceWorker.getRegistrations().then(function(rs){
+  rs.forEach(function(r){ r.unregister(); });
+ });
 }
 sb.auth.getSession().then(function(s){ afterLogin(false); });
 </script>
@@ -1327,7 +1348,7 @@ MANIFEST = """{
 }"""
 
 SERVICE_WORKER = """
-const C='mc-v7';
+const C='mc-v8';
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(C).then(c => c.addAll(['/icon.svg','/manifest.webmanifest'])));
   self.skipWaiting();
@@ -1458,14 +1479,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/apply":
             apply_load(body)
         elif path == "/fm-pull":
+            log("fm-pull request")
             token = (body.get("token") or "").strip()
             if not token:
                 self._json(401, {"error": "not signed in"})
                 return
             try:
-                self._json(200, fm_snapshot(token))
+                snap = fm_snapshot(token)
+                log("fm-pull ok %s loads %s premixes" % (len(snap.get("loads") or []), len(snap.get("premixes") or [])))
+                self._json(200, snap)
             except Exception as exc:
-                log("fm-pull: %s" % exc)
+                log("fm-pull failed: %s" % exc)
                 self._json(502, {"error": str(exc)})
             return
         elif path == "/fm-diet":
