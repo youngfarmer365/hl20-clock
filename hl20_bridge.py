@@ -7,11 +7,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -62,6 +66,195 @@ state = {
 }
 mixes = []
 pens: list[dict] = []
+
+SB_URL = "https://bjzvjmaiyuvjmyhozbpq.supabase.co"
+SB_ANON = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+    "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJqenZqbWFpeXV2am15aG96YnBxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUyNDE3MjgsImV4cCI6MjEwMDgxNzcyOH0."
+    "AkB9U_QWODouWtTAJr10yaz6Qj9-Deki4NMLxhtHb3o"
+)
+
+
+def jwt_sub(token: str) -> str | None:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload.encode()))
+        return data.get("sub")
+    except Exception:
+        return None
+
+
+def sb_json(token: str, method: str, path: str, query: dict | None = None, body=None, timeout: float = 8):
+    url = SB_URL + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query, doseq=True)
+    raw_body = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(url, data=raw_body, method=method)
+    req.add_header("apikey", SB_ANON)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Accept", "application/json")
+    if raw_body is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8")
+            return json.loads(text) if text else None
+    except urllib.error.HTTPError as exc:
+        err = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("%s %s %s" % (exc.code, path, err[:180]))
+
+
+def _in_filter(ids: list[str]) -> str:
+    return "in.(%s)" % ",".join(ids)
+
+
+def diet_lines_py(token: str, diet_id: str) -> list[dict]:
+    if not diet_id:
+        return []
+    rows = sb_json(token, "GET", "/rest/v1/diet_ingredients", {
+        "diet_id": "eq.%s" % diet_id,
+        "select": "percent,sort_order,ingredient_id",
+        "order": "sort_order.asc",
+    }, timeout=6) or []
+    ids = [r["ingredient_id"] for r in rows if r.get("ingredient_id")]
+    names = {}
+    if ids:
+        ings = sb_json(token, "GET", "/rest/v1/ingredients", {
+            "id": _in_filter(ids),
+            "select": "id,name",
+        }, timeout=6) or []
+        names = {x["id"]: x["name"] for x in ings}
+    out = []
+    for r in rows:
+        pct = float(r.get("percent") or 0)
+        if pct <= 0:
+            continue
+        out.append({
+            "id": r["ingredient_id"],
+            "name": names.get(r["ingredient_id"], "Feed"),
+            "percent": pct,
+        })
+    return out
+
+
+def fm_snapshot(token: str) -> dict:
+    uid = jwt_sub(token)
+    if not uid:
+        raise RuntimeError("bad login token")
+    members = sb_json(token, "GET", "/rest/v1/farm_members", {
+        "user_id": "eq.%s" % uid,
+        "select": "farm_id",
+        "limit": "1",
+    }, timeout=6) or []
+    if not members:
+        raise RuntimeError("no farm on this login")
+    farm_id = members[0]["farm_id"]
+
+    try:
+        rpc = sb_json(token, "POST", "/rest/v1/rpc/mixer_clock_snapshot", body={}, timeout=6)
+        if isinstance(rpc, dict) and (rpc.get("loads") is not None or rpc.get("premixes") is not None):
+            loads = rpc.get("loads") or []
+            for load in loads:
+                load.setdefault("program_id", load.get("programId"))
+                load.setdefault("pens", [])
+                load.setdefault("recipe", [])
+            premixes = rpc.get("premixes") or []
+            for p in premixes:
+                p.setdefault("dietId", p.get("diet_id") or p.get("id"))
+                p.setdefault("batchKg", p.get("batch_kg") or 500)
+                p.setdefault("lines", [])
+            log("farm RPC %s loads %s premixes" % (len(loads), len(premixes)))
+            return {"farmId": rpc.get("farmId") or farm_id, "loads": loads, "premixes": premixes}
+    except Exception as exc:
+        log("farm RPC skip: %s" % exc)
+
+    loads_rows = sb_json(token, "GET", "/rest/v1/feed_loads", {
+        "farm_id": "eq.%s" % farm_id,
+        "select": "id,name,program_id",
+        "order": "created_at.desc",
+    }, timeout=8) or []
+    load_ids = [r["id"] for r in loads_rows]
+    pens_by_load: dict[str, list] = {}
+    if load_ids:
+        lp = sb_json(token, "GET", "/rest/v1/feed_load_pens", {
+            "load_id": _in_filter(load_ids),
+            "select": "load_id,pen_id,daily_amount_kg,sort_order",
+            "order": "sort_order.asc",
+        }, timeout=8) or []
+        pen_ids = list({r["pen_id"] for r in lp if r.get("pen_id")})
+        names = {}
+        if pen_ids:
+            pr = sb_json(token, "GET", "/rest/v1/pens", {
+                "id": _in_filter(pen_ids),
+                "select": "id,name",
+            }, timeout=6) or []
+            names = {p["id"]: p["name"] for p in pr}
+        for r in lp:
+            pens_by_load.setdefault(r["load_id"], []).append({
+                "id": r["pen_id"],
+                "name": names.get(r["pen_id"], "Pen"),
+                "kg": float(r.get("daily_amount_kg") or 0),
+            })
+    loads = [{
+        "id": r["id"],
+        "name": r["name"],
+        "program_id": r.get("program_id"),
+        "pens": pens_by_load.get(r["id"], []),
+        "recipe": [],
+    } for r in loads_rows]
+
+    ings = sb_json(token, "GET", "/rest/v1/ingredients", {
+        "farm_id": "eq.%s" % farm_id,
+        "select": "id,name,premix_diet_id",
+    }, timeout=6) or []
+    try:
+        diets = sb_json(token, "GET", "/rest/v1/diets", {
+            "farm_id": "eq.%s" % farm_id,
+            "select": "id,name,diet_type,is_active",
+            "order": "name.asc",
+        }, timeout=6) or []
+    except Exception:
+        diets = sb_json(token, "GET", "/rest/v1/diets", {
+            "farm_id": "eq.%s" % farm_id,
+            "select": "id,name",
+            "order": "name.asc",
+        }, timeout=6) or []
+
+    typed = [d for d in diets if str(d.get("diet_type") or "").lower() == "premix" and d.get("is_active") is not False]
+    linked = {i.get("premix_diet_id") for i in ings if i.get("premix_diet_id")}
+    if not typed:
+        typed = [d for d in diets if d.get("id") in linked]
+    if not typed:
+        typed = [d for d in diets if re.search(r"premix|pre mix", d.get("name") or "", re.I)]
+    seen = {}
+    premixes = []
+    for d in typed:
+        did = d.get("id")
+        if not did or did in seen:
+            continue
+        seen[did] = True
+        as_ing = next((i for i in ings if i.get("premix_diet_id") == did), None)
+        premixes.append({
+            "dietId": did,
+            "name": d.get("name") or "Premix",
+            "ingredientId": as_ing["id"] if as_ing else None,
+            "batchKg": float(d.get("batch_kg") or 500),
+            "lines": [],
+        })
+    for i in ings:
+        pid = i.get("premix_diet_id")
+        if pid and pid not in seen:
+            seen[pid] = True
+            premixes.append({
+                "dietId": pid,
+                "name": i.get("name") or "Premix",
+                "ingredientId": i.get("id"),
+                "batchKg": 500,
+                "lines": [],
+            })
+    log("farm pull %s loads %s premixes" % (len(loads), len(premixes)))
+    return {"farmId": farm_id, "loads": loads, "premixes": premixes}
 
 
 def key_frame(payload8: str) -> bytes:
@@ -370,6 +563,7 @@ body{min-height:100dvh;padding:max(10px,env(safe-area-inset-top)) 12px max(12px,
 .card.done b{color:#8dff9a}
 .row{display:flex;gap:8px;flex-wrap:wrap}
 button{appearance:none;font:700 17px/1.1 ui-sans-serif,system-ui,sans-serif;min-height:52px;padding:12px 14px;border-radius:12px;border:2px solid #ececec;background:#fff;color:#111;flex:1}
+button.on{background:#fff;color:#111;border-color:#ececec}
 button.ghost{background:#111;color:#fff;border-color:#3a3a3a}
 button.good{background:#148a3a;color:#fff;border-color:#1fbb52}
 button.danger{background:#c1121f;color:#fff;border-color:#ff6b6b;flex:0 0 30%;margin-left:auto}
@@ -411,7 +605,7 @@ body.flash-over{background:#4a0000}
 <section class="screen" id="sHome">
   <div class="top">
     <div>
-      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v6</span></div>
+      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v7</span></div>
       <div class="sub" id="syncTag"><span class="dot" id="netDot"></span>Never synced</div>
     </div>
     <div class="row" style="flex:0 0 auto">
@@ -503,8 +697,8 @@ body.flash-over{background:#4a0000}
 var SB_URL='https://bjzvjmaiyuvjmyhozbpq.supabase.co';
 var SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJqenZqbWFpeXV2am15aG96YnBxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUyNDE3MjgsImV4cCI6MjEwMDgxNzcyOH0.AkB9U_QWODouWtTAJr10yaz6Qj9-Deki4NMLxhtHb3o';
 var sb=supabase.createClient(SB_URL,SB_KEY);
-var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false,refreshGen=0;
-var CACHE='mc_cache', QUEUE='mc_queue';
+var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false,refreshGen=0,lastErr='';
+var CACHE='mc_cache_v7', QUEUE='mc_queue';
 function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function doneKey(){return 'mc_done_'+today();}
 function show(id){['sLogin','sHome','sBuffer','sAmount','sFill','sClock','sBay'].forEach(function(s){document.getElementById(s).className='screen'+(s===id?' on':'');}); if(id==='sFill'||id==='sClock') armWake();}
@@ -572,8 +766,32 @@ function resolveBlend(day,phases){
  }
  var last=s[s.length-1]; return {from:last.diet_id,to:last.diet_id,fs:1,ts:0};
 }
+async function authToken(){
+ var s=await withTimeout(sb.auth.getSession(),4000);
+ return s&&s.data&&s.data.session&&s.data.session.access_token;
+}
+async function pullViaLaptop(){
+ var token=await authToken();
+ if(!token) throw new Error('Not signed in');
+ var r=await withTimeout(fetch('/fm-pull',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})}),20000);
+ var d=await r.json();
+ if(!r.ok||d.error) throw new Error((d&&d.error)||('HTTP '+r.status));
+ farmId=d.farmId||farmId;
+ loads=d.loads||[];
+ premixes=d.premixes||[];
+ applyLoadOrder(loads);
+ lastSync=Date.now(); lastErr=''; online=true; saveCache();
+}
 async function dietLines(dietId){
  if(!dietId) return [];
+ try{
+  var token=await authToken();
+  if(token){
+   var r=await withTimeout(fetch('/fm-diet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token,dietId:dietId})}),10000);
+   var d=await r.json();
+   if(r.ok&&d.lines) return d.lines;
+  }
+ }catch(e){}
  try{
   var di=await withTimeout(sb.from('diet_ingredients').select('percent,sort_order,ingredient_id').eq('diet_id',dietId).order('sort_order'),6000);
   var rows=di.data||[];
@@ -669,23 +887,8 @@ async function pullLoads(){
 }
 
 async function pullCloud(){
- if(!farmId) throw new Error('no farm');
- try{
-  var r=await withTimeout(sb.rpc('mixer_clock_snapshot'),7000);
-  if(!r.error && r.data){
-   var d=typeof r.data==='string'?JSON.parse(r.data):r.data;
-   if(d.farmId) farmId=d.farmId;
-   premixes=d.premixes||[];
-   var next=d.loads||[];
-   applyLoadOrder(next);
-   loads=next;
-   lastSync=Date.now(); online=true; saveCache();
-   return;
-  }
- }catch(e){}
- await pullPremixes();
- await pullLoads();
- lastSync=Date.now(); online=true; saveCache();
+ if(!farmId && !(await authToken())) throw new Error('no farm');
+ await pullViaLaptop();
 }
 function blendDiets(fromL,toL,fs,ts){
  var map={};
@@ -760,35 +963,42 @@ async function afterLogin(force){
   var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),8000);
   farmId=mem.data&&mem.data.farm_id;
   if(!farmId){ document.getElementById('loginErr').textContent='No farm on this login'; show('sLogin'); return; }
-  await withTimeout(pullCloud(),15000);
-  online=true; try{ await withTimeout(flushQueue(),8000); }catch(e){}
+  await pullViaLaptop();
+  online=true; lastErr=''; try{ await withTimeout(flushQueue(),8000); }catch(e){}
  }catch(e){
   online=false;
+  lastErr=(e&&e.message)?e.message:'could not reach Farm Manager';
   if(cache){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; }
  }
  renderHome(); show('sHome');
 }
 
 function renderHome(){
- document.getElementById('tabLoads').className=tab==='loads'?'':'ghost';
- document.getElementById('tabPremix').className=tab==='premix'?'':'ghost';
- document.getElementById('netDot').className='dot'+(online?' on':'');
- document.getElementById('syncTag').innerHTML='<span class="dot '+(online?'on':'')+'"></span>'+fmtWhen(lastSync)+(online?'':' · offline');
- var qn=queue().length;
- document.getElementById('queueTag').textContent=qn? (qn+' waiting to upload') : (loads.length+' loads · '+premixes.length+' premixes');
- var box=document.getElementById('listBox');
- if(tab==='loads'){
-  box.innerHTML=loads.length?loads.map(function(m,i){
-   var done=isDone(m.id);
-   var kg=(m.pens||[]).reduce(function(s,p){return s+Number(p.kg||0);},0);
-   var nIng=(m.recipe&&m.recipe.length)?m.recipe.length+' ingredients':(m.pens||[]).length+' pens';
-   return '<div class="cardwrap"><input class="ord" type="number" min="1" value="'+(m.order||(i+1))+'" onchange="setOrder('+i+',this.value)"><button class="card'+(done?' done':'')+'" onclick="openLoad('+i+')"><div><b>'+m.name+'</b><span>'+Math.round(kg)+' kg · '+nIng+(done?' · completed today':'')+'</span></div></button></div>';
-  }).join(''):'<p class="sub">No loads in Farm Manager. Add them under Feeding → Loads, then Refresh.</p>';
- }else{
-  box.innerHTML=premixes.length?premixes.map(function(m,i){
-   var done=isDone('px-'+m.dietId);
-   return '<button class="card'+(done?' done':'')+'" onclick="openPremix('+i+')"><div><b>'+m.name+'</b><span>Usual '+(m.batchKg||500)+' kg'+(done?' · mixed today':'')+'</span></div></button>';
-  }).join(''):'<p class="sub">No premixes in Farm Manager. Open Feeding → Premixes, tap Save premix, then Refresh here.</p>';
+ try{
+  document.getElementById('tabLoads').className=tab==='loads'?'on':'ghost';
+  document.getElementById('tabPremix').className=tab==='premix'?'on':'ghost';
+  document.getElementById('netDot').className='dot'+(online?' on':'');
+  var status=fmtWhen(lastSync)+(online?'':' · offline')+(lastErr?(' · '+lastErr):'');
+  document.getElementById('syncTag').innerHTML='<span class="dot '+(online?'on':'')+'"></span>'+status;
+  var qn=queue().length;
+  document.getElementById('queueTag').textContent=loads.length+' loads · '+premixes.length+' premixes'+(qn?(' · '+qn+' queued'):'');
+  var box=document.getElementById('listBox');
+  if(tab==='loads'){
+   box.innerHTML=loads.length?loads.map(function(m,i){
+    var done=isDone(m.id);
+    var kg=(m.pens||[]).reduce(function(s,p){return s+Number(p.kg||0);},0);
+    var nIng=(m.recipe&&m.recipe.length)?m.recipe.length+' ingredients':(m.pens||[]).length+' pens';
+    return '<div class="cardwrap"><input class="ord" type="number" min="1" value="'+(m.order||(i+1))+'" onchange="setOrder('+i+',this.value)"><button class="card'+(done?' done':'')+'" onclick="openLoad('+i+')"><div><b>'+m.name+'</b><span>'+Math.round(kg)+' kg · '+nIng+(done?' · completed today':'')+'</span></div></button></div>';
+   }).join(''):'<p class="sub">No loads in Farm Manager. Add them under Feeding → Loads, then Refresh.</p>';
+  }else{
+   box.innerHTML=premixes.length?premixes.map(function(m,i){
+    var done=isDone('px-'+(m.dietId||m.id||i));
+    return '<button class="card'+(done?' done':'')+'" onclick="openPremix('+i+')"><div><b>'+(m.name||'Premix')+'</b><span>Usual '+(m.batchKg||500)+' kg'+(done?' · mixed today':'')+'</span></div></button>';
+   }).join(''):'<p class="sub">No premixes in Farm Manager. Open Feeding → Premixes, tap Save premix, then Refresh here.</p>';
+  }
+ }catch(e){
+  lastErr=e.message||String(e);
+  document.getElementById('listBox').innerHTML='<p class="sub">List error: '+lastErr+'</p>';
  }
 }
 function setOrder(i,v){
@@ -802,32 +1012,24 @@ document.getElementById('bRefresh').onclick=async function(){
  var gen=++refreshGen;
  var btn=document.getElementById('bRefresh');
  btn.textContent='Wait';
+ lastErr='';
  document.getElementById('syncTag').textContent='Refreshing…';
  var dog=setTimeout(function(){
   if(gen!==refreshGen) return;
   btn.textContent='Refresh';
   online=false;
-  document.getElementById('queueTag').textContent='Refresh timed out — use SIM / Wi-Fi Assist';
+  lastErr='laptop could not reach Farm Manager in 20s';
   renderHome();
- }, 8000);
+ }, 22000);
  try{
-  if(!farmId){
-   var gu=await withTimeout(sb.auth.getUser(), 4000);
-   var user=gu && gu.data && gu.data.user;
-   if(user){
-    var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),5000);
-    farmId=mem.data&&mem.data.farm_id;
-   }
-   if(!farmId) throw new Error('Not logged in to a farm');
-  }
-  await withTimeout(pullCloud(),7000);
-  try{ await withTimeout(flushQueue(),4000); }catch(e){}
+  await pullViaLaptop();
+  try{ await withTimeout(flushQueue(),8000); }catch(e){}
   if(gen!==refreshGen) return;
-  online=true;
+  online=true; lastErr='';
  }catch(e){
   if(gen!==refreshGen) return;
   online=false;
-  document.getElementById('queueTag').textContent=(e&&e.message?e.message:'Refresh failed')+' — using cache';
+  lastErr=(e&&e.message)?e.message:'Refresh failed';
  }
  clearTimeout(dog);
  if(gen!==refreshGen) return;
@@ -1125,7 +1327,7 @@ MANIFEST = """{
 }"""
 
 SERVICE_WORKER = """
-const C='mc-v6';
+const C='mc-v7';
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(C).then(c => c.addAll(['/icon.svg','/manifest.webmanifest'])));
   self.skipWaiting();
@@ -1136,7 +1338,7 @@ self.addEventListener('activate', e => {
 });
 self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
-  if (u.hostname.includes('supabase') || u.pathname.startsWith('/weight') || u.pathname.startsWith('/zero') || u.pathname.startsWith('/start') || u.pathname.startsWith('/apply') || u.pathname === '/' || u.pathname === '/clock' || u.pathname === '/sw.js') {
+  if (u.hostname.includes('supabase') || u.pathname.startsWith('/fm-') || u.pathname.startsWith('/weight') || u.pathname.startsWith('/zero') || u.pathname.startsWith('/start') || u.pathname.startsWith('/apply') || u.pathname === '/' || u.pathname === '/clock' || u.pathname === '/sw.js') {
     return;
   }
   e.respondWith(
@@ -1255,6 +1457,28 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         elif path == "/apply":
             apply_load(body)
+        elif path == "/fm-pull":
+            token = (body.get("token") or "").strip()
+            if not token:
+                self._json(401, {"error": "not signed in"})
+                return
+            try:
+                self._json(200, fm_snapshot(token))
+            except Exception as exc:
+                log("fm-pull: %s" % exc)
+                self._json(502, {"error": str(exc)})
+            return
+        elif path == "/fm-diet":
+            token = (body.get("token") or "").strip()
+            diet_id = body.get("dietId") or ""
+            if not token:
+                self._json(401, {"error": "not signed in"})
+                return
+            try:
+                self._json(200, {"lines": diet_lines_py(token, diet_id)})
+            except Exception as exc:
+                self._json(502, {"error": str(exc)})
+            return
         else:
             self._json(404, {"error": "not found"})
             return

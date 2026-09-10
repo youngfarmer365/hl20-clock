@@ -37,6 +37,7 @@ body{min-height:100dvh;padding:max(10px,env(safe-area-inset-top)) 12px max(12px,
 .card.done b{color:#8dff9a}
 .row{display:flex;gap:8px;flex-wrap:wrap}
 button{appearance:none;font:700 17px/1.1 ui-sans-serif,system-ui,sans-serif;min-height:52px;padding:12px 14px;border-radius:12px;border:2px solid #ececec;background:#fff;color:#111;flex:1}
+button.on{background:#fff;color:#111;border-color:#ececec}
 button.ghost{background:#111;color:#fff;border-color:#3a3a3a}
 button.good{background:#148a3a;color:#fff;border-color:#1fbb52}
 button.danger{background:#c1121f;color:#fff;border-color:#ff6b6b;flex:0 0 30%;margin-left:auto}
@@ -78,7 +79,7 @@ body.flash-over{background:#4a0000}
 <section class="screen" id="sHome">
   <div class="top">
     <div>
-      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v6</span></div>
+      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v7</span></div>
       <div class="sub" id="syncTag"><span class="dot" id="netDot"></span>Never synced</div>
     </div>
     <div class="row" style="flex:0 0 auto">
@@ -170,8 +171,8 @@ body.flash-over{background:#4a0000}
 var SB_URL='https://bjzvjmaiyuvjmyhozbpq.supabase.co';
 var SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJqenZqbWFpeXV2am15aG96YnBxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUyNDE3MjgsImV4cCI6MjEwMDgxNzcyOH0.AkB9U_QWODouWtTAJr10yaz6Qj9-Deki4NMLxhtHb3o';
 var sb=supabase.createClient(SB_URL,SB_KEY);
-var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false,refreshGen=0;
-var CACHE='mc_cache', QUEUE='mc_queue';
+var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false,refreshGen=0,lastErr='';
+var CACHE='mc_cache_v7', QUEUE='mc_queue';
 function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function doneKey(){return 'mc_done_'+today();}
 function show(id){['sLogin','sHome','sBuffer','sAmount','sFill','sClock','sBay'].forEach(function(s){document.getElementById(s).className='screen'+(s===id?' on':'');}); if(id==='sFill'||id==='sClock') armWake();}
@@ -239,8 +240,32 @@ function resolveBlend(day,phases){
  }
  var last=s[s.length-1]; return {from:last.diet_id,to:last.diet_id,fs:1,ts:0};
 }
+async function authToken(){
+ var s=await withTimeout(sb.auth.getSession(),4000);
+ return s&&s.data&&s.data.session&&s.data.session.access_token;
+}
+async function pullViaLaptop(){
+ var token=await authToken();
+ if(!token) throw new Error('Not signed in');
+ var r=await withTimeout(fetch('/fm-pull',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})}),20000);
+ var d=await r.json();
+ if(!r.ok||d.error) throw new Error((d&&d.error)||('HTTP '+r.status));
+ farmId=d.farmId||farmId;
+ loads=d.loads||[];
+ premixes=d.premixes||[];
+ applyLoadOrder(loads);
+ lastSync=Date.now(); lastErr=''; online=true; saveCache();
+}
 async function dietLines(dietId){
  if(!dietId) return [];
+ try{
+  var token=await authToken();
+  if(token){
+   var r=await withTimeout(fetch('/fm-diet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token,dietId:dietId})}),10000);
+   var d=await r.json();
+   if(r.ok&&d.lines) return d.lines;
+  }
+ }catch(e){}
  try{
   var di=await withTimeout(sb.from('diet_ingredients').select('percent,sort_order,ingredient_id').eq('diet_id',dietId).order('sort_order'),6000);
   var rows=di.data||[];
@@ -336,23 +361,8 @@ async function pullLoads(){
 }
 
 async function pullCloud(){
- if(!farmId) throw new Error('no farm');
- try{
-  var r=await withTimeout(sb.rpc('mixer_clock_snapshot'),7000);
-  if(!r.error && r.data){
-   var d=typeof r.data==='string'?JSON.parse(r.data):r.data;
-   if(d.farmId) farmId=d.farmId;
-   premixes=d.premixes||[];
-   var next=d.loads||[];
-   applyLoadOrder(next);
-   loads=next;
-   lastSync=Date.now(); online=true; saveCache();
-   return;
-  }
- }catch(e){}
- await pullPremixes();
- await pullLoads();
- lastSync=Date.now(); online=true; saveCache();
+ if(!farmId && !(await authToken())) throw new Error('no farm');
+ await pullViaLaptop();
 }
 function blendDiets(fromL,toL,fs,ts){
  var map={};
@@ -427,35 +437,42 @@ async function afterLogin(force){
   var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),8000);
   farmId=mem.data&&mem.data.farm_id;
   if(!farmId){ document.getElementById('loginErr').textContent='No farm on this login'; show('sLogin'); return; }
-  await withTimeout(pullCloud(),15000);
-  online=true; try{ await withTimeout(flushQueue(),8000); }catch(e){}
+  await pullViaLaptop();
+  online=true; lastErr=''; try{ await withTimeout(flushQueue(),8000); }catch(e){}
  }catch(e){
   online=false;
+  lastErr=(e&&e.message)?e.message:'could not reach Farm Manager';
   if(cache){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; }
  }
  renderHome(); show('sHome');
 }
 
 function renderHome(){
- document.getElementById('tabLoads').className=tab==='loads'?'':'ghost';
- document.getElementById('tabPremix').className=tab==='premix'?'':'ghost';
- document.getElementById('netDot').className='dot'+(online?' on':'');
- document.getElementById('syncTag').innerHTML='<span class="dot '+(online?'on':'')+'"></span>'+fmtWhen(lastSync)+(online?'':' · offline');
- var qn=queue().length;
- document.getElementById('queueTag').textContent=qn? (qn+' waiting to upload') : (loads.length+' loads · '+premixes.length+' premixes');
- var box=document.getElementById('listBox');
- if(tab==='loads'){
-  box.innerHTML=loads.length?loads.map(function(m,i){
-   var done=isDone(m.id);
-   var kg=(m.pens||[]).reduce(function(s,p){return s+Number(p.kg||0);},0);
-   var nIng=(m.recipe&&m.recipe.length)?m.recipe.length+' ingredients':(m.pens||[]).length+' pens';
-   return '<div class="cardwrap"><input class="ord" type="number" min="1" value="'+(m.order||(i+1))+'" onchange="setOrder('+i+',this.value)"><button class="card'+(done?' done':'')+'" onclick="openLoad('+i+')"><div><b>'+m.name+'</b><span>'+Math.round(kg)+' kg · '+nIng+(done?' · completed today':'')+'</span></div></button></div>';
-  }).join(''):'<p class="sub">No loads in Farm Manager. Add them under Feeding → Loads, then Refresh.</p>';
- }else{
-  box.innerHTML=premixes.length?premixes.map(function(m,i){
-   var done=isDone('px-'+m.dietId);
-   return '<button class="card'+(done?' done':'')+'" onclick="openPremix('+i+')"><div><b>'+m.name+'</b><span>Usual '+(m.batchKg||500)+' kg'+(done?' · mixed today':'')+'</span></div></button>';
-  }).join(''):'<p class="sub">No premixes in Farm Manager. Open Feeding → Premixes, tap Save premix, then Refresh here.</p>';
+ try{
+  document.getElementById('tabLoads').className=tab==='loads'?'on':'ghost';
+  document.getElementById('tabPremix').className=tab==='premix'?'on':'ghost';
+  document.getElementById('netDot').className='dot'+(online?' on':'');
+  var status=fmtWhen(lastSync)+(online?'':' · offline')+(lastErr?(' · '+lastErr):'');
+  document.getElementById('syncTag').innerHTML='<span class="dot '+(online?'on':'')+'"></span>'+status;
+  var qn=queue().length;
+  document.getElementById('queueTag').textContent=loads.length+' loads · '+premixes.length+' premixes'+(qn?(' · '+qn+' queued'):'');
+  var box=document.getElementById('listBox');
+  if(tab==='loads'){
+   box.innerHTML=loads.length?loads.map(function(m,i){
+    var done=isDone(m.id);
+    var kg=(m.pens||[]).reduce(function(s,p){return s+Number(p.kg||0);},0);
+    var nIng=(m.recipe&&m.recipe.length)?m.recipe.length+' ingredients':(m.pens||[]).length+' pens';
+    return '<div class="cardwrap"><input class="ord" type="number" min="1" value="'+(m.order||(i+1))+'" onchange="setOrder('+i+',this.value)"><button class="card'+(done?' done':'')+'" onclick="openLoad('+i+')"><div><b>'+m.name+'</b><span>'+Math.round(kg)+' kg · '+nIng+(done?' · completed today':'')+'</span></div></button></div>';
+   }).join(''):'<p class="sub">No loads in Farm Manager. Add them under Feeding → Loads, then Refresh.</p>';
+  }else{
+   box.innerHTML=premixes.length?premixes.map(function(m,i){
+    var done=isDone('px-'+(m.dietId||m.id||i));
+    return '<button class="card'+(done?' done':'')+'" onclick="openPremix('+i+')"><div><b>'+(m.name||'Premix')+'</b><span>Usual '+(m.batchKg||500)+' kg'+(done?' · mixed today':'')+'</span></div></button>';
+   }).join(''):'<p class="sub">No premixes in Farm Manager. Open Feeding → Premixes, tap Save premix, then Refresh here.</p>';
+  }
+ }catch(e){
+  lastErr=e.message||String(e);
+  document.getElementById('listBox').innerHTML='<p class="sub">List error: '+lastErr+'</p>';
  }
 }
 function setOrder(i,v){
@@ -469,32 +486,24 @@ document.getElementById('bRefresh').onclick=async function(){
  var gen=++refreshGen;
  var btn=document.getElementById('bRefresh');
  btn.textContent='Wait';
+ lastErr='';
  document.getElementById('syncTag').textContent='Refreshing…';
  var dog=setTimeout(function(){
   if(gen!==refreshGen) return;
   btn.textContent='Refresh';
   online=false;
-  document.getElementById('queueTag').textContent='Refresh timed out — use SIM / Wi-Fi Assist';
+  lastErr='laptop could not reach Farm Manager in 20s';
   renderHome();
- }, 8000);
+ }, 22000);
  try{
-  if(!farmId){
-   var gu=await withTimeout(sb.auth.getUser(), 4000);
-   var user=gu && gu.data && gu.data.user;
-   if(user){
-    var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),5000);
-    farmId=mem.data&&mem.data.farm_id;
-   }
-   if(!farmId) throw new Error('Not logged in to a farm');
-  }
-  await withTimeout(pullCloud(),7000);
-  try{ await withTimeout(flushQueue(),4000); }catch(e){}
+  await pullViaLaptop();
+  try{ await withTimeout(flushQueue(),8000); }catch(e){}
   if(gen!==refreshGen) return;
-  online=true;
+  online=true; lastErr='';
  }catch(e){
   if(gen!==refreshGen) return;
   online=false;
-  document.getElementById('queueTag').textContent=(e&&e.message?e.message:'Refresh failed')+' — using cache';
+  lastErr=(e&&e.message)?e.message:'Refresh failed';
  }
  clearTimeout(dog);
  if(gen!==refreshGen) return;
