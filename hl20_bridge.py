@@ -626,7 +626,7 @@ async function pullPremixes(){
   ings.forEach(function(i){ if(i.premix_diet_id) linked[i.premix_diet_id]=true; });
   typed=rows.filter(function(d){ return linked[d.id]; });
  }
- if(!typed.length) typed=rows.filter(function(d){ return /pre\s?mix/i.test(d.name||''); });
+ if(!typed.length) typed=rows.filter(function(d){ return /premix|pre mix/i.test(d.name||''); });
  var seen={}, plist=[];
  typed.forEach(function(d){
   if(seen[d.id]) return; seen[d.id]=true;
