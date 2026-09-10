@@ -400,11 +400,11 @@ body.flash-over{background:#4a0000}
 <section class="screen on" id="sLogin">
   <div class="h">Mixer Clock</div>
   <p class="sub">Farm Manager login. After Refresh, Share → Add to Home Screen. Recipes stay on the iPad if the page is killed.</p>
-  <form id="loginForm">
+  <form id="loginForm" action="#" method="post">
     <label>Email</label><input id="email" type="email" autocomplete="username" required>
     <label>Password</label><input id="pass" type="password" autocomplete="current-password" required>
     <p class="sub" id="loginErr" style="color:#ff6b6b"></p>
-    <div class="row" style="margin-top:12px"><button type="submit">Log in</button></div>
+    <div class="row" style="margin-top:12px"><button type="submit" id="bLogin">Log in</button></div>
   </form>
 </section>
 
@@ -503,7 +503,7 @@ body.flash-over{background:#4a0000}
 var SB_URL='https://bjzvjmaiyuvjmyhozbpq.supabase.co';
 var SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJqenZqbWFpeXV2am15aG96YnBxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUyNDE3MjgsImV4cCI6MjEwMDgxNzcyOH0.AkB9U_QWODouWtTAJr10yaz6Qj9-Deki4NMLxhtHb3o';
 var sb=supabase.createClient(SB_URL,SB_KEY);
-var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0;
+var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false;
 var CACHE='mc_cache', QUEUE='mc_queue';
 function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function doneKey(){return 'mc_done_'+today();}
@@ -542,7 +542,14 @@ function markDone(id){var a=[];try{a=JSON.parse(localStorage.getItem(doneKey())|
 function isDone(id){try{return JSON.parse(localStorage.getItem(doneKey())||'[]').indexOf(id)>=0;}catch(e){return false;}}
 function fmtWhen(ts){if(!ts) return 'Never synced'; var d=new Date(ts); return 'Farm Manager '+d.toLocaleString();}
 function withTimeout(p,ms){
- return Promise.race([p, new Promise(function(_,rej){ setTimeout(function(){ rej(new Error('timeout')); }, ms||10000); })]);
+  return new Promise(function(res,rej){
+    var done=false;
+    var t=setTimeout(function(){ if(!done){ done=true; rej(new Error('timeout')); } }, ms||8000);
+    Promise.resolve(p).then(
+      function(v){ if(!done){ done=true; clearTimeout(t); res(v); } },
+      function(e){ if(!done){ done=true; clearTimeout(t); rej(e); } }
+    );
+  });
 }
 
 function programmeDay(prog){
@@ -707,16 +714,22 @@ async function flushQueue(){
 }
 
 async function afterLogin(force){
- var user=(await sb.auth.getUser()).data.user;
+ if(loggedOut && !force){ show('sLogin'); return; }
+ var user=null;
+ try{
+  var gu=await withTimeout(sb.auth.getUser(), 6000);
+  user=gu && gu.data && gu.data.user;
+ }catch(e){ user=null; }
  var cache=loadCache();
- if(!user && cache){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; online=false; renderHome(); show('sHome'); return; }
+ if(!user && cache && !force && !loggedOut){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; online=false; renderHome(); show('sHome'); return; }
  if(!user){ show('sLogin'); return; }
+ loggedOut=false;
  if(cache&&cache.farmId){ farmId=cache.farmId; loads=cache.loads||[]; premixes=cache.premixes||[]; lastSync=cache.lastSync; renderHome(); show('sHome'); }
  try{
   var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),8000);
   farmId=mem.data&&mem.data.farm_id;
   if(!farmId){ document.getElementById('loginErr').textContent='No farm on this login'; show('sLogin'); return; }
-  await withTimeout(pullCloud(),20000);
+  await withTimeout(pullCloud(),15000);
   online=true; try{ await withTimeout(flushQueue(),8000); }catch(e){}
  }catch(e){
   online=false;
@@ -754,15 +767,38 @@ function setOrder(i,v){
 document.getElementById('tabLoads').onclick=function(){tab='loads';renderHome();};
 document.getElementById('tabPremix').onclick=function(){tab='premix';renderHome();};
 document.getElementById('bRefresh').onclick=async function(){
+ if(busy) return;
+ busy=true;
+ var btn=document.getElementById('bRefresh');
+ btn.textContent='Wait';
  document.getElementById('syncTag').textContent='Refreshing…';
+ var dog=setTimeout(function(){
+  busy=false;
+  btn.textContent='Refresh';
+  online=false;
+  document.getElementById('queueTag').textContent='Refresh timed out — turn on SIM data / Wi-Fi Assist';
+  renderHome();
+ }, 12000);
  try{
-  await withTimeout(pullCloud(),20000);
-  try{ await withTimeout(flushQueue(),8000); }catch(e){}
+  if(!farmId){
+   var gu=await withTimeout(sb.auth.getUser(), 5000);
+   var user=gu && gu.data && gu.data.user;
+   if(user){
+    var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),8000);
+    farmId=mem.data&&mem.data.farm_id;
+   }
+   if(!farmId) throw new Error('Not logged in to a farm');
+  }
+  await withTimeout(pullCloud(),10000);
+  try{ await withTimeout(flushQueue(),5000); }catch(e){}
   online=true;
  }catch(e){
   online=false;
-  document.getElementById('queueTag').textContent=e&&e.message?e.message:'Refresh failed — using cache';
+  document.getElementById('queueTag').textContent=(e&&e.message?e.message:'Refresh failed')+' — using cache';
  }
+ clearTimeout(dog);
+ busy=false;
+ btn.textContent='Refresh';
  renderHome();
 };
 
@@ -926,11 +962,41 @@ document.getElementById('bBayDone').onclick=async function(){
  }
 };
 document.getElementById('bBayHome').onclick=function(){show('sHome');renderHome();};
-document.getElementById('loginForm').onsubmit=async function(e){e.preventDefault();document.getElementById('loginErr').textContent='';
- var res=await sb.auth.signInWithPassword({email:document.getElementById('email').value.trim(),password:document.getElementById('pass').value});
- if(res.error){document.getElementById('loginErr').textContent=res.error.message;return;} afterLogin(true);
+async function doLogin(e){
+ if(e) e.preventDefault();
+ if(busy) return;
+ var email=document.getElementById('email').value.trim();
+ var pass=document.getElementById('pass').value;
+ var err=document.getElementById('loginErr');
+ var btn=document.getElementById('bLogin');
+ if(!email||!pass){ err.textContent='Enter email and password'; return; }
+ busy=true; loggedOut=false;
+ btn.disabled=true; btn.textContent='Signing in…';
+ err.textContent='';
+ try{
+  var res=await withTimeout(sb.auth.signInWithPassword({email:email,password:pass}), 10000);
+  if(res.error) throw res.error;
+  await afterLogin(true);
+ }catch(ex){
+  var msg=(ex&&ex.message)?ex.message:'Login failed';
+  if(msg==='timeout' || /fetch|network|failed/i.test(msg)) msg='No internet. Turn on cellular / Wi-Fi Assist, then try again.';
+  err.textContent=msg;
+  show('sLogin');
+ }
+ busy=false;
+ btn.disabled=false; btn.textContent='Log in';
+}
+document.getElementById('loginForm').onsubmit=doLogin;
+document.getElementById('bLogin').onclick=function(e){ doLogin(e); };
+document.getElementById('bLogout').onclick=function(){
+ loggedOut=true;
+ show('sLogin');
+ document.getElementById('loginErr').textContent='';
+ document.getElementById('bLogin').disabled=false;
+ document.getElementById('bLogin').textContent='Log in';
+ busy=false;
+ withTimeout(sb.auth.signOut(), 4000).catch(function(){});
 };
-document.getElementById('bLogout').onclick=async function(){await sb.auth.signOut();show('sLogin');};
 document.getElementById('bClockHome').onclick=function(){show('sHome');};
 document.getElementById('bFinish').onclick=async function(){
  try{
@@ -991,7 +1057,10 @@ async function tick(){
  }
 }
 setInterval(tick,250); tick();
-if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(function(){});
+if('serviceWorker' in navigator){
+ navigator.serviceWorker.getRegistrations().then(function(rs){ rs.forEach(function(r){ r.update(); }); });
+ navigator.serviceWorker.register('/sw.js').catch(function(){});
+}
 sb.auth.getSession().then(function(s){ afterLogin(false); });
 </script>
 </body>
@@ -1009,9 +1078,9 @@ MANIFEST = """{
 }"""
 
 SERVICE_WORKER = """
-const C='mc-v3';
+const C='mc-v4';
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(C).then(c => c.addAll(['/','/icon.svg','/manifest.webmanifest'])));
+  e.waitUntil(caches.open(C).then(c => c.addAll(['/icon.svg','/manifest.webmanifest'])));
   self.skipWaiting();
 });
 self.addEventListener('activate', e => {
@@ -1020,13 +1089,12 @@ self.addEventListener('activate', e => {
 });
 self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
-  if (u.pathname.startsWith('/weight') || u.pathname.startsWith('/zero') || u.hostname.includes('supabase')) {
-    e.respondWith(fetch(e.request).catch(() => new Response('{"error":"offline"}',{headers:{'Content-Type':'application/json'}})));
+  if (u.hostname.includes('supabase') || u.pathname.startsWith('/weight') || u.pathname.startsWith('/zero') || u.pathname.startsWith('/start') || u.pathname.startsWith('/apply') || u.pathname === '/' || u.pathname === '/clock' || u.pathname === '/sw.js') {
     return;
   }
   e.respondWith(
     fetch(e.request).then(r => { const c=r.clone(); caches.open(C).then(cache => cache.put(e.request,c)); return r; })
-      .catch(() => caches.match(e.request).then(r => r || caches.match('/')))
+      .catch(() => caches.match(e.request))
   );
 });
 """
