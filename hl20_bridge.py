@@ -411,7 +411,7 @@ body.flash-over{background:#4a0000}
 <section class="screen" id="sHome">
   <div class="top">
     <div>
-      <div class="h">Yard</div>
+      <div class="h">Yard <span style="opacity:.35;font-size:11px;letter-spacing:0">v6</span></div>
       <div class="sub" id="syncTag"><span class="dot" id="netDot"></span>Never synced</div>
     </div>
     <div class="row" style="flex:0 0 auto">
@@ -503,7 +503,7 @@ body.flash-over{background:#4a0000}
 var SB_URL='https://bjzvjmaiyuvjmyhozbpq.supabase.co';
 var SB_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJqenZqbWFpeXV2am15aG96YnBxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODUyNDE3MjgsImV4cCI6MjEwMDgxNzcyOH0.AkB9U_QWODouWtTAJr10yaz6Qj9-Deki4NMLxhtHb3o';
 var sb=supabase.createClient(SB_URL,SB_KEY);
-var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false;
+var farmId=null,tab='loads',loads=[],premixes=[],job=null,online=false,lastSync=null,lastLive=null,wake=null,hitTarget=false,hitOver=false,fetchFails=0,loggedOut=false,busy=false,refreshGen=0;
 var CACHE='mc_cache', QUEUE='mc_queue';
 function today(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
 function doneKey(){return 'mc_done_'+today();}
@@ -575,15 +575,117 @@ function resolveBlend(day,phases){
 async function dietLines(dietId){
  if(!dietId) return [];
  try{
-  var di=await withTimeout(sb.from('diet_ingredients').select('percent,sort_order,ingredient_id').eq('diet_id',dietId).order('sort_order'),8000);
+  var di=await withTimeout(sb.from('diet_ingredients').select('percent,sort_order,ingredient_id').eq('diet_id',dietId).order('sort_order'),6000);
   var rows=di.data||[];
   var ids=rows.map(function(r){return r.ingredient_id;}).filter(Boolean), names={};
   if(ids.length){
-   var ing=await withTimeout(sb.from('ingredients').select('id,name').in('id',ids),8000);
+   var ing=await withTimeout(sb.from('ingredients').select('id,name').in('id',ids),6000);
    (ing.data||[]).forEach(function(x){names[x.id]=x.name;});
   }
   return rows.map(function(r){return {id:r.ingredient_id,name:names[r.ingredient_id]||'Feed',percent:Number(r.percent)||0};}).filter(function(r){return r.percent>0;});
  }catch(e){ return []; }
+}
+async function fetchRecipe(load){
+ if(!load||!load.program_id) return load.recipe||[];
+ try{
+  var prog=await withTimeout(sb.from('feeding_programs').select('start_date,status,pause_days,paused_on').eq('id',load.program_id).single(),6000);
+  var ph=await withTimeout(sb.from('program_phases').select('sort_order,diet_id,steady_days,transition_days').eq('program_id',load.program_id).order('sort_order'),6000);
+  var b=resolveBlend(programmeDay(prog.data||{}), ph.data||[]);
+  var fromL=await dietLines(b.from);
+  var toL=(b.to&&b.to!==b.from)?await dietLines(b.to):fromL;
+  return blendDiets(fromL,toL,b.fs,b.ts);
+ }catch(e){ return load.recipe||[]; }
+}
+function applyLoadOrder(next){
+ var prev={};
+ (loadCache()&&loadCache().loads||[]).forEach(function(l){ if(l.order) prev[l.id]=l.order; });
+ next.forEach(function(l,i){ l.order = prev[l.id] || (i+1); });
+ next.sort(function(a,b){return (a.order||99)-(b.order||99);});
+}
+
+async function pullPremixes(){
+ var ings=[];
+ try{
+  var iq=await withTimeout(sb.from('ingredients').select('id,name,premix_diet_id').eq('farm_id',farmId),6000);
+  ings=iq.data||[];
+ }catch(e){}
+ var rows=[];
+ try{
+  var dq=await withTimeout(sb.from('diets').select('id,name,diet_type,is_active').eq('farm_id',farmId).order('name'),6000);
+  if(dq.error) throw dq.error;
+  rows=dq.data||[];
+ }catch(e){
+  try{
+   var d2=await withTimeout(sb.from('diets').select('id,name').eq('farm_id',farmId).order('name'),6000);
+   rows=d2.data||[];
+  }catch(e2){ rows=[]; }
+ }
+ var typed=rows.filter(function(d){ return String(d.diet_type||'').toLowerCase()==='premix' && d.is_active!==false; });
+ if(!typed.length){
+  var linked={};
+  ings.forEach(function(i){ if(i.premix_diet_id) linked[i.premix_diet_id]=true; });
+  typed=rows.filter(function(d){ return linked[d.id]; });
+ }
+ if(!typed.length) typed=rows.filter(function(d){ return /pre\s?mix/i.test(d.name||''); });
+ var seen={}, plist=[];
+ typed.forEach(function(d){
+  if(seen[d.id]) return; seen[d.id]=true;
+  var asIng=ings.find(function(x){return x.premix_diet_id===d.id;});
+  plist.push({dietId:d.id,name:d.name,ingredientId:asIng?asIng.id:null,batchKg:500,lines:[]});
+ });
+ ings.forEach(function(i){
+  if(!i.premix_diet_id||seen[i.premix_diet_id]) return;
+  seen[i.premix_diet_id]=true;
+  plist.push({dietId:i.premix_diet_id,name:i.name,ingredientId:i.id,batchKg:500,lines:[]});
+ });
+ premixes=plist;
+}
+
+async function pullLoads(){
+ var lq=await withTimeout(sb.from('feed_loads').select('id,name,program_id').eq('farm_id',farmId).order('created_at',{ascending:false}),8000);
+ if(lq.error) throw lq.error;
+ var list=lq.data||[];
+ var ids=list.map(function(l){return l.id;});
+ var pensByLoad={}, names={};
+ if(ids.length){
+  try{
+   var lp=await withTimeout(sb.from('feed_load_pens').select('load_id,pen_id,daily_amount_kg,sort_order').in('load_id',ids).order('sort_order'),6000);
+   var penIds=[];
+   (lp.data||[]).forEach(function(r){ if(penIds.indexOf(r.pen_id)<0) penIds.push(r.pen_id); });
+   if(penIds.length){
+    var pr=await withTimeout(sb.from('pens').select('id,name').in('id',penIds),6000);
+    (pr.data||[]).forEach(function(p){names[p.id]=p.name;});
+   }
+   (lp.data||[]).forEach(function(r){
+    (pensByLoad[r.load_id]=pensByLoad[r.load_id]||[]).push({id:r.pen_id,name:names[r.pen_id]||'Pen',kg:Number(r.daily_amount_kg)||0});
+   });
+  }catch(e){}
+ }
+ var next=list.map(function(load){
+  return {id:load.id,name:load.name,program_id:load.program_id,pens:pensByLoad[load.id]||[],recipe:[]};
+ });
+ applyLoadOrder(next);
+ loads=next;
+}
+
+async function pullCloud(){
+ if(!farmId) throw new Error('no farm');
+ try{
+  var r=await withTimeout(sb.rpc('mixer_clock_snapshot'),7000);
+  if(!r.error && r.data){
+   var d=typeof r.data==='string'?JSON.parse(r.data):r.data;
+   if(d.farmId) farmId=d.farmId;
+   premixes=d.premixes||[];
+   var next=d.loads||[];
+   applyLoadOrder(next);
+   loads=next;
+   lastSync=Date.now(); online=true; saveCache();
+   return;
+  }
+ }catch(e){}
+ await pullPremixes();
+ await pullLoads();
+ lastSync=Date.now(); online=true; saveCache();
 }
 function blendDiets(fromL,toL,fs,ts){
  var map={};
@@ -600,77 +702,6 @@ function mixKg(total,lines){
 }
 function rebuildCum(rows){
  var run=0; return rows.map(function(r){run+=Number(r.kg)||0; r.cum=Number(run.toFixed(2)); return r;});
-}
-
-async function pullPremixes(){
- var ings={data:[]};
- try{ ings=await withTimeout(sb.from('ingredients').select('id,name,premix_diet_id').eq('farm_id',farmId),8000); }catch(e){}
- var dq={data:[],error:null};
- try{ dq=await withTimeout(sb.from('diets').select('id,name,batch_kg,diet_type,is_active').eq('farm_id',farmId).order('name'),8000); }
- catch(e){ dq={data:[],error:e}; }
- if(dq.error||!dq.data){
-  try{ dq=await withTimeout(sb.from('diets').select('id,name').eq('farm_id',farmId).order('name'),8000); }
-  catch(e){ dq={data:[]}; }
- }
- var rows=dq.data||[];
- var typed=rows.filter(function(d){ return String(d.diet_type||'').toLowerCase()==='premix'; });
- if(!typed.length){
-  var linked={};
-  (ings.data||[]).forEach(function(i){ if(i.premix_diet_id) linked[i.premix_diet_id]=true; });
-  typed=rows.filter(function(d){ return linked[d.id]; });
- }
- if(!typed.length) typed=rows.filter(function(d){ return /premix/i.test(d.name||''); });
- var plist=[];
- for(var j=0;j<typed.length;j++){
-  var d=typed[j];
-  if(d.is_active===false) continue;
-  var asIng=(ings.data||[]).find(function(x){return x.premix_diet_id===d.id;});
-  plist.push({dietId:d.id,name:d.name,ingredientId:asIng?asIng.id:null,batchKg:Number(d.batch_kg||500)||500,lines:await dietLines(d.id)});
- }
- premixes=plist;
-}
-
-async function pullLoads(){
- var lq=await withTimeout(sb.from('feed_loads').select('id,name,program_id').eq('farm_id',farmId).order('created_at',{ascending:false}),10000);
- if(lq.error) throw lq.error;
- var next=[];
- for(var i=0;i<(lq.data||[]).length;i++){
-  try{
-   var load=lq.data[i];
-   var rows=await withTimeout(sb.from('feed_load_pens').select('pen_id,daily_amount_kg,sort_order').eq('load_id',load.id).order('sort_order'),8000);
-   var lp=rows.data||[], ids=lp.map(function(r){return r.pen_id;}), names={};
-   if(ids.length){
-    var pr=await withTimeout(sb.from('pens').select('id,name').in('id',ids),8000);
-    (pr.data||[]).forEach(function(p){names[p.id]=p.name;});
-   }
-   var pens=lp.map(function(r){return {id:r.pen_id,name:names[r.pen_id]||'Pen',kg:Number(r.daily_amount_kg)||0};});
-   var recipe=[];
-   if(load.program_id){
-    var prog=await withTimeout(sb.from('feeding_programs').select('start_date,status,pause_days,paused_on').eq('id',load.program_id).single(),8000);
-    var ph=await withTimeout(sb.from('program_phases').select('sort_order,diet_id,steady_days,transition_days').eq('program_id',load.program_id).order('sort_order'),8000);
-    var phases=ph.data||[];
-    var b=resolveBlend(programmeDay(prog.data||{}),phases);
-    var fromL=await dietLines(b.from);
-    var toL=(b.to&&b.to!==b.from)?await dietLines(b.to):fromL;
-    recipe=blendDiets(fromL,toL,b.fs,b.ts);
-   }
-   next.push({id:load.id,name:load.name,program_id:load.program_id,pens:pens,recipe:recipe});
-  }catch(e){}
- }
- var prev={};
- (loadCache()&&loadCache().loads||[]).forEach(function(l){ if(l.order) prev[l.id]=l.order; });
- next.forEach(function(l,i){ l.order = prev[l.id] || (i+1); });
- next.sort(function(a,b){return (a.order||99)-(b.order||99);});
- loads=next;
-}
-
-async function pullCloud(){
- if(!farmId) throw new Error('no farm');
- var preErr=null, loadErr=null;
- try{ await pullPremixes(); }catch(e){ preErr=e; }
- try{ await pullLoads(); }catch(e){ loadErr=e; }
- if(!premixes.length && !loads.length && (preErr||loadErr)) throw (loadErr||preErr);
- lastSync=Date.now(); online=true; saveCache();
 }
 
 async function flushQueue(){
@@ -744,19 +775,20 @@ function renderHome(){
  document.getElementById('netDot').className='dot'+(online?' on':'');
  document.getElementById('syncTag').innerHTML='<span class="dot '+(online?'on':'')+'"></span>'+fmtWhen(lastSync)+(online?'':' · offline');
  var qn=queue().length;
- document.getElementById('queueTag').textContent=qn? (qn+' waiting to upload') : '';
+ document.getElementById('queueTag').textContent=qn? (qn+' waiting to upload') : (loads.length+' loads · '+premixes.length+' premixes');
  var box=document.getElementById('listBox');
  if(tab==='loads'){
   box.innerHTML=loads.length?loads.map(function(m,i){
    var done=isDone(m.id);
    var kg=(m.pens||[]).reduce(function(s,p){return s+Number(p.kg||0);},0);
-   return '<div class="cardwrap"><input class="ord" type="number" min="1" value="'+(m.order||(i+1))+'" onchange="setOrder('+i+',this.value)"><button class="card'+(done?' done':'')+'" onclick="openLoad('+i+')"><div><b>'+m.name+'</b><span>'+Math.round(kg)+' kg · '+(m.recipe||[]).length+' ingredients'+(done?' · completed today':'')+'</span></div></button></div>';
-  }).join(''):'<p class="sub">No loads cached. Connect and tap Refresh.</p>';
+   var nIng=(m.recipe&&m.recipe.length)?m.recipe.length+' ingredients':(m.pens||[]).length+' pens';
+   return '<div class="cardwrap"><input class="ord" type="number" min="1" value="'+(m.order||(i+1))+'" onchange="setOrder('+i+',this.value)"><button class="card'+(done?' done':'')+'" onclick="openLoad('+i+')"><div><b>'+m.name+'</b><span>'+Math.round(kg)+' kg · '+nIng+(done?' · completed today':'')+'</span></div></button></div>';
+  }).join(''):'<p class="sub">No loads in Farm Manager. Add them under Feeding → Loads, then Refresh.</p>';
  }else{
   box.innerHTML=premixes.length?premixes.map(function(m,i){
    var done=isDone('px-'+m.dietId);
-   return '<button class="card'+(done?' done':'')+'" onclick="openPremix('+i+')"><div><b>'+m.name+'</b><span>Usual '+m.batchKg+' kg'+(done?' · mixed today':'')+'</span></div></button>';
-  }).join(''):'<p class="sub">No premixes cached. Create one in Farm Manager Feeding → Premixes, then Refresh on SIM data.</p>';
+   return '<button class="card'+(done?' done':'')+'" onclick="openPremix('+i+')"><div><b>'+m.name+'</b><span>Usual '+(m.batchKg||500)+' kg'+(done?' · mixed today':'')+'</span></div></button>';
+  }).join(''):'<p class="sub">No premixes in Farm Manager. Open Feeding → Premixes, tap Save premix, then Refresh here.</p>';
  }
 }
 function setOrder(i,v){
@@ -767,42 +799,43 @@ function setOrder(i,v){
 document.getElementById('tabLoads').onclick=function(){tab='loads';renderHome();};
 document.getElementById('tabPremix').onclick=function(){tab='premix';renderHome();};
 document.getElementById('bRefresh').onclick=async function(){
- if(busy) return;
- busy=true;
+ var gen=++refreshGen;
  var btn=document.getElementById('bRefresh');
  btn.textContent='Wait';
  document.getElementById('syncTag').textContent='Refreshing…';
  var dog=setTimeout(function(){
-  busy=false;
+  if(gen!==refreshGen) return;
   btn.textContent='Refresh';
   online=false;
-  document.getElementById('queueTag').textContent='Refresh timed out — turn on SIM data / Wi-Fi Assist';
+  document.getElementById('queueTag').textContent='Refresh timed out — use SIM / Wi-Fi Assist';
   renderHome();
- }, 12000);
+ }, 8000);
  try{
   if(!farmId){
-   var gu=await withTimeout(sb.auth.getUser(), 5000);
+   var gu=await withTimeout(sb.auth.getUser(), 4000);
    var user=gu && gu.data && gu.data.user;
    if(user){
-    var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),8000);
+    var mem=await withTimeout(sb.from('farm_members').select('farm_id').eq('user_id',user.id).limit(1).maybeSingle(),5000);
     farmId=mem.data&&mem.data.farm_id;
    }
    if(!farmId) throw new Error('Not logged in to a farm');
   }
-  await withTimeout(pullCloud(),10000);
-  try{ await withTimeout(flushQueue(),5000); }catch(e){}
+  await withTimeout(pullCloud(),7000);
+  try{ await withTimeout(flushQueue(),4000); }catch(e){}
+  if(gen!==refreshGen) return;
   online=true;
  }catch(e){
+  if(gen!==refreshGen) return;
   online=false;
   document.getElementById('queueTag').textContent=(e&&e.message?e.message:'Refresh failed')+' — using cache';
  }
  clearTimeout(dog);
- busy=false;
+ if(gen!==refreshGen) return;
  btn.textContent='Refresh';
  renderHome();
 };
 
-function openLoad(i){
+async function openLoad(i){
  var load=loads[i]; if(!load) return;
  var pens=load.pens||[];
  var pensSum=pens.reduce(function(s,p){return s+Number(p.kg||0);},0);
@@ -812,23 +845,37 @@ function openLoad(i){
  document.getElementById('bufKg').value='0';
  document.getElementById('bufChips').innerHTML=[-100,-50,-25,0,25,50,100].map(function(n){return '<button class="chip" onclick="setBuf('+n+')">'+(n>0?('+'+n):n)+'</button>';}).join('');
  updBuf(); show('sBuffer');
+ if(!job.recipe.length){
+  document.getElementById('bufFill').textContent='Loading recipe…';
+  load.recipe=await fetchRecipe(load);
+  job.recipe=load.recipe||[];
+  saveCache();
+  updBuf();
+ }
 }
 function setBuf(n){document.getElementById('bufKg').value=String(n);updBuf();}
 function updBuf(){if(!job)return;var b=Number(document.getElementById('bufKg').value)||0;document.getElementById('bufFill').textContent='Fill total '+Math.round(job.pensSum+b)+' kg';}
 document.getElementById('bufKg').oninput=updBuf;
 document.getElementById('bBufBack').onclick=function(){show('sHome');};
 document.getElementById('bBufGo').onclick=async function(){
+ if(!job) return;
+ if(!job.recipe.length) job.recipe=await fetchRecipe({id:job.id,program_id:job.programId,recipe:[]});
  job.buffer=Number(document.getElementById('bufKg').value)||0;
  job.ingredients=mixKg(Math.max(0,job.pensSum+job.buffer),job.recipe||[]);
  job.fillIndex=0; job.fillAnchor=null; job.captureAnchor=false; job.rebalAsked=false;
  await post('/apply',{name:job.name,pens:job.pens,ingredients:job.ingredients});
  show('sFill'); paintFill();
 };
-function openPremix(i){
+async function openPremix(i){
  var p=premixes[i]; if(!p) return;
- job={kind:'premix',id:'px-'+p.dietId,name:p.name,dietId:p.dietId,ingredientId:p.ingredientId,amount:p.batchKg,lines:p.lines||[],ingredients:[],fillIndex:0,fillAnchor:null,captureAnchor:false,lastAdv:0,rebalAsked:false,pens:[]};
+ if(!p.lines||!p.lines.length){
+  p.lines=await dietLines(p.dietId);
+  premixes[i].lines=p.lines;
+  saveCache();
+ }
+ job={kind:'premix',id:'px-'+p.dietId,name:p.name,dietId:p.dietId,ingredientId:p.ingredientId,amount:p.batchKg||500,lines:p.lines||[],ingredients:[],fillIndex:0,fillAnchor:null,captureAnchor:false,lastAdv:0,rebalAsked:false,pens:[]};
  document.getElementById('amtName').textContent=p.name;
- document.getElementById('amtKg').value=String(p.batchKg);
+ document.getElementById('amtKg').value=String(job.amount);
  document.getElementById('amtChips').innerHTML=[250,500,750,1000,1500].map(function(n){return '<button class="chip" onclick="setAmt('+n+')">'+n+'</button>';}).join('');
  updAmt(); show('sAmount');
 }
@@ -1078,7 +1125,7 @@ MANIFEST = """{
 }"""
 
 SERVICE_WORKER = """
-const C='mc-v4';
+const C='mc-v6';
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(C).then(c => c.addAll(['/icon.svg','/manifest.webmanifest'])));
   self.skipWaiting();
@@ -1131,7 +1178,8 @@ class Handler(BaseHTTPRequestHandler):
             page = PAGE.encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             self.wfile.write(page)
